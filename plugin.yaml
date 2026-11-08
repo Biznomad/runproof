@@ -1,0 +1,4 @@
+name: runproof
+version: "0.1.0"
+description: Verify fresh JSON evidence for a completed Hermes cron execution.
+requires_hermes: ">=0.23.0"
