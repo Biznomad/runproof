@@ -1,19 +1,20 @@
 # RunProof
 
-**Verify the report behind a successful Hermes cron run.**
+**Gate downstream work on the report behind a successful Hermes cron run.**
 
-A cron job can exit successfully while yesterday's JSON report stays on disk. RunProof compares the report with the recorded execution window, checks required fields, and returns a JSON verdict and exit code for downstream automation.
+A producer can exit successfully while yesterday’s JSON stays on disk. RunProof checks Hermes’s execution record and the report, records a verdict, and releases the exact verified bytes to a local SQLite outbox once per workflow slot.
 
 ```mermaid
 flowchart LR
-    A["Hermes cron completes"] --> B["RunProof checks JSON"]
-    B -->|"Old file"| C["FAIL · stale_report"]
-    B -->|"Fresh, complete file"| D["PASS · verified"]
+    A["Hermes cron completes"] --> B["RunProof verifies report"]
+    B -->|"Stale, missing, or invalid"| C["Blocked · receipt saved"]
+    B -->|"Fresh and valid"| D["Released · one outbox row"]
+    D -->|"Same slot retried"| E["Replay skipped"]
 ```
 
-## Run the demo
+## Quickstart
 
-With Hermes Agent 0.23.0 and Python 3.11+ on PATH on macOS or Linux:
+Use Hermes Agent v0.23.0 and Python 3.11+ on macOS or Linux.
 
 ```sh
 git clone https://github.com/Biznomad/runproof.git
@@ -21,20 +22,20 @@ cd runproof
 ./demo.py --state-dir "$(mktemp -d)"
 ```
 
-The demo installs and enables RunProof in a disposable Hermes home. It creates four one-shot schedules and invokes the real scheduler tick after each due time. Follow the terminal or open the checkpoint and receipts in the printed directory. Ctrl-C pauses the demo. Reuse the same directory to resume. Running `./demo.py` without arguments uses `.demo/local/`.
+The demo schedules four real Hermes one-shot jobs in an isolated home and ticks the scheduler after each due time. All four producers complete.
 
-Observed on Hermes v0.23.0 with four real one-shot schedules and a synthetic order report.
-
-| Hermes cron | RunProof | Evidence |
+| Evidence | Gate | Outbox rows |
 | --- | --- | --- |
-| completed | FAIL | Old JSON was left in place |
-| completed | FAIL | Fresh JSON omitted `summary` |
-| completed | PASS | Fresh JSON populated all required fields |
-| completed | PASS | A second corrected execution produced the same bytes |
+| Yesterday’s report | Blocked · `stale_report` | 0 |
+| Fresh JSON missing a required field | Blocked · `unpopulated_fields` | 0 |
+| Corrected report | Released | 1 |
+| Same execution retried, then another run for the same slot | Replay skipped | 1 |
 
-## Install into a Hermes home
+An independent check reads the ledger and hashes its payload. The demo writes its checkpoint and receipts to the printed directory. Rerun with the same directory to resume.
 
-Set the target to the intended Hermes profile directory before installing:
+## Install and gate a report
+
+Set `HERMES_HOME` to the intended profile before installing.
 
 ```sh
 export HERMES_HOME=/absolute/path/to/hermes-home
@@ -44,19 +45,29 @@ hermes plugins enable runproof
 hermes runproof --help
 ```
 
-After the producing cron job has finished, run the verifier with the exact job ID:
+After the producer finishes, verify and release one report. Choose a stable key for the logical slot and reuse it if the producer needs a retry.
 
 ```sh
 hermes runproof JOB_ID /absolute/path/to/report.json \
-  --require report_id --require orders --require summary
+  --require report_id --require orders --expect-true checks_ok \
+  --ledger /absolute/private/path/gate.sqlite --key daily-orders:2026-11-07
 ```
 
-RunProof emits one JSON object and exits 0 for PASS or 1 for FAIL. It requires a completed latest execution, a regular file of at most 1 MiB written within the execution window, and populated top-level fields. Empty strings, whitespace, nulls, empty arrays and empty objects fail. Zero and false are valid values. A PASS includes the execution ID, timestamps and SHA-256 of the bytes checked.
+The verifier uses the latest Hermes execution for that job by default. Supply `--execution EXECUTION_ID` to pin an exact attempt. The attempt must belong to the specified job and have completed. The report must be a regular JSON object of at most 1 MiB, written inside the execution window. Required fields must be populated. Zero and false count as populated. `--expect-true` specifically requires JSON `true`. Omit `--ledger` and `--key` for a verification-only receipt.
 
-The verifier uses filesystem modification time as freshness evidence. It checks field presence and population. A writer with access to the report and its timestamps can forge that evidence, and simultaneous writers should use separate report paths. The integration uses Hermes's `cron.executions.latest_execution` helper, verified on v0.23.0. The plugin runs on demand as a CLI gate.
+## Retries and downstream consumption
 
-## Permissions and local data
+- **Blocked** returns exit 1 with an actionable reason. Fix and rerun the producer, then retry the same key, report path, and field policy. The retry can have a different execution ID.
+- **Released** returns exit 0 and atomically commits the receipt and payload. **Replay skipped** also returns exit 0 after successful verification and identifies the original release. Both decisions preserve a single outbox row. Treat the outbox as the input to downstream work.
+- A consumer reads `release_key`, `execution`, `sha256`, and `payload` from `outbox`, using `release_key` as its idempotency key. Concurrent gate invocations serialize through SQLite. External side effects need their own idempotent consumer.
+- Use one ledger in an operator-owned directory on a local filesystem. On a ledger error, the CLI returns exit 1 with `gate=unknown`. Retry the same key after checking permissions or contention. Keep the database for deduplication and use a fresh key for each new logical slot.
 
-The installed CLI reads the active Hermes profile's cron execution history and the report path supplied by the operator. It makes zero network calls and starts zero subprocesses. The optional demo invokes the local Hermes CLI and writes synthetic reports and execution state to its isolated directory. RunProof is MIT-licensed.
+The receipt ties the hashed snapshot to the recorded job and execution window. Freshness relies on filesystem timestamps and a dedicated producer-owned report path. Treat writers with access to that path or its timestamps as trusted.
 
-[Hermes plugin guide](https://hermes-agent.nousresearch.com/docs/developer-guide/plugins) · [Hermes cron guide](https://hermes-agent.nousresearch.com/docs/user-guide/features/cron)
+## Local data and compatibility
+
+The installed CLI reads cron history and the supplied report, and writes the optional ledger, including full accepted report bytes. Keep the ledger and its SQLite sidecars private. The plugin makes zero network calls and starts zero subprocesses. The demo starts local Hermes subprocesses and writes to its isolated directory.
+
+Hermes v0.23.0 was tested. The CLI uses the public registration API and internal cron history helpers. Hermes’s validator reports those helpers as a compatibility advisory. Run `python3 -m unittest -v test_gate` for concurrent release, blocked evidence, and transaction rollback checks.
+
+[Hermes plugin guide](https://hermes-agent.nousresearch.com/docs/developer-guide/plugins) · [Hermes cron guide](https://hermes-agent.nousresearch.com/docs/user-guide/features/cron) · [MIT license](LICENSE)

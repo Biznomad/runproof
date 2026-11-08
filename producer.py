@@ -10,6 +10,10 @@ if mode != "stale":
     if mode == "good":
         data["summary"] = "Synthetic daily report"
     pending = root / "report.tmp"
-    pending.write_text(json.dumps(data))
+    captured = root / f"capture-{mode}.json"
+    if captured.exists():
+        pending.write_bytes(captured.read_bytes())
+    else:
+        pending.write_text(json.dumps(data))
     os.replace(pending, root / "report.json")
 print("Producer completed")
